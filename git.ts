@@ -561,8 +561,12 @@ export type GitPacket =
 export function pktLine(line: string | Buffer): Buffer {
   const payload = typeof line === 'string' ? Buffer.from(line, 'utf8') : line;
   const length = payload.length + 4;
-  const header = Buffer.from(length.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([header, payload]);
+  // One allocation: the 4-byte hex length header plus the payload, instead of
+  // a header buffer, a payload buffer and a concat of the two.
+  const out = Buffer.allocUnsafe(length);
+  out.write(length.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  payload.copy(out, 4);
+  return out;
 }
 
 export const PKT_FLUSH = Buffer.from('0000', 'ascii');

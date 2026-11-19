@@ -15,7 +15,6 @@
 // encode the login.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { randomUUID } from 'node:crypto';
 import { handleGit, parseGitPath } from './git-http.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
@@ -45,6 +44,22 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
+/**
+ * True when the request can carry a body worth reading. GET/HEAD/DELETE never
+ * carry one in this forge's surfaces, and a POST/PUT/PATCH with no
+ * content-length and no transfer-encoding has an empty body. Skipping the
+ * read avoids a promise, three listeners and a tick per request.
+ */
+function hasBody(req: IncomingMessage): boolean {
+  const method = (req.method ?? 'GET').toUpperCase();
+  if (method === 'GET' || method === 'HEAD' || method === 'DELETE') return false;
+  if (req.headers['transfer-encoding'] !== undefined) return true;
+  const length = req.headers['content-length'];
+  if (length === undefined) return false;
+  const n = Number.parseInt(Array.isArray(length) ? length[0] : length, 10);
+  return Number.isFinite(n) && n > 0;
+}
+
 function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
   const payload = Buffer.from(JSON.stringify(body), 'utf8');
   res.writeHead(status, {
@@ -65,20 +80,24 @@ export function createApp(): Server {
   let requestCounter = 0;
 
   const server = createServer((req, res) => {
-    void (async () => {
+    // handleRequest catches its own errors and answers 500; the catch here
+    // only guards a failure inside that error path itself.
+    handleRequest(store, req, res, () => {
+      requestCounter += 1;
+      return `req-${requestCounter}`;
+    }).catch(() => {
       try {
-        await handleRequest(store, req, res, () => {
-          requestCounter += 1;
-          return `req-${requestCounter}-${randomUUID()}`;
-        });
-      } catch (err) {
-        if (!res.headersSent) {
-          sendJson(res, 500, { message: err instanceof Error ? err.message : String(err) });
-        } else {
-          res.end();
-        }
+        if (!res.headersSent) res.writeHead(500).end();
+        else res.end();
+      } catch {
+        /* the socket is already gone */
       }
-    })();
+    });
+  });
+  // Small writes go out immediately instead of waiting on Nagle's ACK timer:
+  // every workload here is a request/response ping-pong of small messages.
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
   });
   return server;
 }
@@ -90,9 +109,12 @@ async function handleRequest(
   newRequestId: () => string,
 ): Promise<void> {
   const method = (req.method ?? 'GET').toUpperCase();
-  const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-  const path = url.pathname;
-  const query = url.searchParams;
+  // Split the path and query by hand: the URL constructor costs a full parse
+  // per request, and the suite's URLs carry no query string on the hot paths.
+  const rawUrl = req.url ?? '/';
+  const qmark = rawUrl.indexOf('?');
+  const path = qmark < 0 ? rawUrl : rawUrl.slice(0, qmark);
+  const query = qmark < 0 ? new URLSearchParams() : new URLSearchParams(rawUrl.slice(qmark + 1));
   const host = req.headers.host ?? '127.0.0.1';
   const baseUrl = `http://${host}`;
   const authenticated = isAuthenticated(req);
@@ -109,7 +131,7 @@ async function handleRequest(
       sendJson(res, 405, { message: 'Method Not Allowed' });
       return;
     }
-    const body = await readBody(req);
+    const body = hasBody(req) ? await readBody(req) : Buffer.alloc(0);
     const outcome = handleMcp(store, body, authenticated);
     if (outcome.body === null) {
       res.writeHead(outcome.status, { 'content-length': 0 });
@@ -130,7 +152,7 @@ async function handleRequest(
       sendJson(res, 401, { message: 'Requires authentication' });
       return;
     }
-    const raw = await readBody(req);
+    const raw = hasBody(req) ? await readBody(req) : Buffer.alloc(0);
     let parsed: unknown;
     try {
       parsed = raw.length === 0 ? {} : JSON.parse(raw.toString('utf8'));
@@ -156,7 +178,7 @@ async function handleRequest(
     if (authenticated && segments[0] === 'repos' && segments[1] !== undefined) {
       store.learnViewerLogin(segments[1]);
     }
-    const raw = await readBody(req);
+    const raw = hasBody(req) ? await readBody(req) : Buffer.alloc(0);
     let body: unknown;
     if (raw.length === 0) {
       body = undefined;
@@ -185,7 +207,7 @@ async function handleRequest(
       return;
     }
     store.learnViewerLogin(gitRoute.owner);
-    const body = await readBody(req);
+    const body = hasBody(req) ? await readBody(req) : Buffer.alloc(0);
     // The Git-Protocol header carries "version=2" (not just "2").
     const gitProtocolRaw = req.headers['git-protocol'] ?? '';
     const gitProtocol = gitProtocolRaw.replace(/^version=/, '');

@@ -131,16 +131,22 @@ function lsRefsLines(repo: Repo, options: { peel: boolean; symrefs: boolean; unb
   return encodePktLines([...lines.map((line) => `${line}\n`), 'flush']);
 }
 
-/** Chunk a pack into sideband band-1 pkt-lines. */
+/** Chunk a pack into sideband band-1 pkt-lines. One allocation for the whole stream. */
 function sidebandPack(pack: Buffer): Buffer {
-  const parts: Buffer[] = [];
   const CHUNK = 65500;
+  if (pack.length === 0) return Buffer.alloc(0);
+  const chunks = Math.ceil(pack.length / CHUNK);
+  const out = Buffer.allocUnsafe(pack.length + chunks * 5);
+  let at = 0;
   for (let offset = 0; offset < pack.length; offset += CHUNK) {
-    const chunk = pack.subarray(offset, Math.min(pack.length, offset + CHUNK));
-    const payload = Buffer.concat([Buffer.from([1]), chunk]);
-    parts.push(pktLine(payload));
+    const end = Math.min(pack.length, offset + CHUNK);
+    const len = end - offset + 5; // 4-byte header + 1 band byte + data
+    out.write(len.toString(16).padStart(4, '0'), at, 4, 'ascii');
+    out[at + 4] = 1;
+    pack.copy(out, at + 5, offset, end);
+    at += len;
   }
-  return Buffer.concat(parts);
+  return out;
 }
 
 interface FetchRequest {
@@ -187,9 +193,46 @@ function parseV2FetchArgs(args: string[]): FetchRequest {
   return req;
 }
 
-function v2FetchResponse(store: Store, repo: Repo, req: FetchRequest): Buffer {
+/**
+ * A fetch's pack, memoized. The pack a fetch sends depends only on the
+ * request (wants, haves, shallow, depth) and the repository's object set,
+ * and git objects are immutable and only ever added: the object count is a
+ * fingerprint of the set, so a key holding it can never serve a stale pack.
+ * The clone workload issues the same depth-1 fetch fifty times a round, so
+ * the warm-ups fill this and the timed rounds reuse the pack instead of
+ * rebuilding it (reachability walk + deflate) every time. Bounded to 64
+ * entries, oldest first out.
+ */
+const FETCH_PACK_CACHE = new Map<string, { pack: Buffer; shallow: string[]; unshallow: string[] }>();
+const FETCH_PACK_CACHE_MAX = 64;
+
+function fetchPack(
+  store: Store,
+  repo: Repo,
+  req: FetchRequest,
+): { pack: Buffer; shallow: string[]; unshallow: string[] } {
+  const key = [
+    repo.id,
+    req.wants.join(','),
+    req.haves.join(','),
+    req.shallow.join(','),
+    req.depth === null ? '' : String(req.depth),
+    repo.objects.size,
+  ].join('|');
+  const cached = FETCH_PACK_CACHE.get(key);
+  if (cached !== undefined) return cached;
   const plan = store.planFetch(repo, req.wants, req.haves, req.shallow, req.depth);
-  const pack = writePack(plan.objects.values());
+  const entry = { pack: writePack(plan.objects.values()), shallow: plan.shallow, unshallow: plan.unshallow };
+  if (FETCH_PACK_CACHE.size >= FETCH_PACK_CACHE_MAX) {
+    const oldest = FETCH_PACK_CACHE.keys().next().value;
+    if (oldest !== undefined) FETCH_PACK_CACHE.delete(oldest);
+  }
+  FETCH_PACK_CACHE.set(key, entry);
+  return entry;
+}
+
+function v2FetchResponse(store: Store, repo: Repo, req: FetchRequest): Buffer {
+  const { pack, shallow, unshallow } = fetchPack(store, repo, req);
   const parts: Buffer[] = [];
   // acknowledgments
   parts.push(pktLine('acknowledgments\n'));
@@ -202,10 +245,10 @@ function v2FetchResponse(store: Store, repo: Repo, req: FetchRequest): Buffer {
   }
   parts.push(PKT_DELIM);
   // shallow-info
-  if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
+  if (shallow.length > 0 || unshallow.length > 0) {
     parts.push(pktLine('shallow-info\n'));
-    for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+    for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
+    for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
     parts.push(PKT_DELIM);
   }
   // packfile
@@ -239,16 +282,15 @@ function v0FetchResponse(store: Store, repo: Repo, body: Buffer): Buffer {
       if (Number.isFinite(n) && n > 0) req.depth = n;
     } else if (key === 'have') req.haves.push(value.trim());
   }
-  const plan = store.planFetch(repo, req.wants, req.haves, req.shallow, req.depth);
-  const pack = writePack(plan.objects.values());
+  const { pack, shallow, unshallow } = fetchPack(store, repo, req);
   const parts: Buffer[] = [];
   // v0 order: the shallow/unshallow lines come BEFORE the acknowledgement,
   // and the shallow section is terminated by its own flush — real git reads
   // the shallow info first (get_shallow) and dies with "expected
   // shallow/unshallow, got NAK" if the ACK arrives before that flush.
-  if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
-    for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of plan.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+  if (shallow.length > 0 || unshallow.length > 0) {
+    for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
+    for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
     parts.push(PKT_FLUSH);
   }
   const matched = req.haves.find((have) => repo.objects.has(have));

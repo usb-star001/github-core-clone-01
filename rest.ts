@@ -24,8 +24,21 @@ function b64decode(content: string): Buffer {
   return Buffer.from(content.replace(/[\r\n\t ]+/g, ''), 'base64');
 }
 
+/**
+ * The current time as an ISO string. toISOString is deterministic within one
+ * millisecond, so the value is cached per millisecond: the read workload
+ * calls this twice per issue and thousands of times a round, and most of
+ * those calls land in the same millisecond.
+ */
+let cachedIsoMs = -1;
+let cachedIso = '';
 function isoNow(): string {
-  return new Date().toISOString();
+  const ms = Date.now();
+  if (ms !== cachedIsoMs) {
+    cachedIsoMs = ms;
+    cachedIso = new Date(ms).toISOString();
+  }
+  return cachedIso;
 }
 
 // -- shapes -------------------------------------------------------------------
